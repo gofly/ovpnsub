@@ -2,10 +2,8 @@ package main
 
 import (
 	"bytes"
-	"crypto/hmac"
-	"crypto/sha1"
+	"context"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/pem"
 	"encoding/xml"
 	"errors"
@@ -14,54 +12,21 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
-	"math/rand"
 	"net/http"
 	"os"
 	"path"
-	"strconv"
 	"strings"
-	"sync"
 	"text/template"
-	"time"
+
+	"github.com/gofly/ovpnsub/auth"
 )
 
 var (
-	sessions map[string]Session
-	lock     sync.RWMutex
-	encKey   string
-	keysPath string
+	authEncKey   string
+	keysPath     string
+	confTplPath  string
+	sanyAuthHost string
 )
-
-type Session struct {
-	Username string
-	Expires  time.Time
-}
-
-func (s *Session) Expired() bool {
-	return time.Now().After(s.Expires)
-}
-
-func init() {
-	sessions = make(map[string]Session)
-}
-
-func genSession(username string) string {
-	sid := strconv.FormatInt(rand.Int63(), 36)
-	lock.Lock()
-	defer lock.Unlock()
-	sessions[sid] = Session{
-		Username: username,
-		Expires:  time.Now().Add(time.Minute * 5),
-	}
-	return sid
-}
-
-func getSession(sid string) (Session, bool) {
-	lock.RLock()
-	defer lock.RUnlock()
-	s, ok := sessions[sid]
-	return s, ok
-}
 
 type MethodCall struct {
 	XMLName    xml.Name `xml:"methodCall"`
@@ -139,38 +104,31 @@ func GetOpenVPNAuth(username string) (*OpenVPNAuth, error) {
 	return auth, nil
 }
 
-func verifyPassword(pwdPath, password string) (ok bool, err error) {
-	data, err := ioutil.ReadFile(pwdPath)
-	if err != nil {
-		return false, err
-	}
-
-	expected := make([]byte, hex.DecodedLen(len(data)))
-	n, err := hex.Decode(expected, data)
-	if err != nil {
-		return
-	}
-	h := hmac.New(sha1.New, []byte(encKey))
-	h.Write([]byte(password))
-	fact := h.Sum(nil)
-	ok = bytes.Equal(fact, expected[:n])
-	return
-}
-
 func main() {
 	flag.StringVar(&keysPath, "keys-path", "/etc/openvpn/client/keys", "keys path")
-	flag.StringVar(&encKey, "enc-key", "", "hmac key")
+	flag.StringVar(&confTplPath, "conf-tpl-path", "config.ovpn.tpl", "keys path")
+	flag.StringVar(&authEncKey, "auth-enc-key", "this_is_enc_key", "key for hmac-sha1 in local auth")
+	flag.StringVar(&sanyAuthHost, "sany-auth-host", "", "sany auth service host")
 	flag.Parse()
 	info, err := os.Stat(keysPath)
 	if err != nil || !info.IsDir() {
 		log.Fatal("keys path invalid")
 	}
 
-	tpl, err := template.ParseFiles("config.ovpn.tpl")
+	tpl, err := template.ParseFiles(confTplPath)
 	if err != nil {
 		log.Fatalf("parse config template with error: %s", err)
 	}
-
+	var authService auth.AuthService
+	if sanyAuthHost != "" {
+		authService = &auth.SanyAuthService{
+			Host: sanyAuthHost,
+		}
+	} else {
+		authService = &auth.LocalAuthService{
+			AuthEncKey: authEncKey,
+		}
+	}
 	http.HandleFunc("/RPC2", func(w http.ResponseWriter, r *http.Request) {
 		call := MethodCall{}
 		err := xml.NewDecoder(r.Body).Decode(&call)
@@ -186,21 +144,17 @@ func main() {
 			sessionID := Member{Name: "session_id"}
 			username, password, ok := r.BasicAuth()
 			if ok {
-				p := path.Join(keysPath, username)
-				info, err := os.Stat(p)
-				if err != nil || !info.IsDir() {
-					log.Printf("[ERROR] stat key path %s is unavailable", p)
+				token, err := authService.Authorize(context.Background(), username, password)
+				if err != nil {
+					log.Printf("[WARN] user %s password incorrect", username)
 				} else {
-					pass, err := verifyPassword(path.Join(p, "password"), password)
-					if err != nil {
-						log.Printf("[ERROR] verify password with error: %s", err)
-					} else if pass {
-						sid := genSession(username)
-						log.Printf("[INFO] gen session %s", sid)
-						status.Value.InnerXML = "<int>0</int>"
-						sessionID.Value.InnerXML = fmt.Sprintf("<string>%s</string>", sid)
+					p := path.Join(keysPath, username)
+					info, err := os.Stat(p)
+					if err != nil || !info.IsDir() {
+						log.Printf("[ERROR] stat key path %s is unavailable", p)
 					} else {
-						log.Printf("[WARN] user %s password incorrect", username)
+						status.Value.InnerXML = "<int>0</int>"
+						sessionID.Value.InnerXML = fmt.Sprintf("<string>%s</string>", token)
 					}
 				}
 			}
@@ -219,21 +173,21 @@ func main() {
 			}
 			io.Copy(w, buf)
 		case "GetUserlogin", "GetAutologin":
-			auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Basic ")
-			authStr, err := base64.StdEncoding.DecodeString(auth)
+			baseAuth := strings.TrimPrefix(r.Header.Get("Authorization"), "Basic ")
+			authVal, err := base64.StdEncoding.DecodeString(baseAuth)
 			if err != nil {
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
-			sid := strings.TrimPrefix(string(authStr), "SESSION_ID:")
-			log.Printf("[INFO] method:%s sid: %s", call.MethodName, sid)
-			session, ok := getSession(sid)
-			if !ok || session.Expired() {
-				log.Printf("[ERROR] session invalid, ok: %t, session: %+v", ok, session)
+			token := strings.TrimPrefix(string(authVal), "SESSION_ID:")
+			log.Printf("[INFO] method:%s token: %s", call.MethodName, token)
+			username, err := authService.VerifyToken(context.Background(), token)
+			if err != nil {
+				log.Printf("[ERROR] session invalid, token: %+v, error: %s", token, err)
 				w.WriteHeader(http.StatusUnauthorized)
 				return
 			}
-			oAuth, err := GetOpenVPNAuth(session.Username)
+			ovpnAuth, err := GetOpenVPNAuth(username)
 			if err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				log.Printf("[ERROR] get ovpn auth error: %s", err)
@@ -247,7 +201,7 @@ func main() {
 			}
 
 			b := bytes.NewBuffer(nil)
-			err = tpl.Execute(b, oAuth)
+			err = tpl.Execute(b, ovpnAuth)
 			if err != nil {
 				log.Printf("[ERROR] execute template with error: %s", err)
 			} else {
