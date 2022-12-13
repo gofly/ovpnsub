@@ -7,8 +7,8 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"errors"
-	"io/ioutil"
 	"math/rand"
+	"os"
 	"path"
 	"sync"
 	"time"
@@ -32,7 +32,7 @@ type LocalAuthService struct {
 
 func (s *LocalAuthService) Authorize(ctx context.Context, username, password string) (string, error) {
 	pwdPath := path.Join(s.KeysPath, username, "password")
-	data, err := ioutil.ReadFile(pwdPath)
+	data, err := os.ReadFile(pwdPath)
 	if err != nil {
 		return "", err
 	}
