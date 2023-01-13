@@ -23,7 +23,7 @@ import (
 
 var (
 	authEncKey   string
-	keysPath     string
+	easyrsaPath  string
 	confTplPath  string
 	sanyAuthHost string
 )
@@ -74,19 +74,19 @@ func readCert(data []byte) (string, error) {
 
 func GetOpenVPNAuth(username string) (*OpenVPNAuth, error) {
 	auth := &OpenVPNAuth{}
-	ca, err := ioutil.ReadFile(path.Join(keysPath, username, "ca.crt"))
+	ca, err := ioutil.ReadFile(path.Join(easyrsaPath, "pki", "ca.crt"))
 	if err != nil {
 		return nil, err
 	}
 	auth.CACert = string(ca)
 
-	ta, err := ioutil.ReadFile(path.Join(keysPath, username, "ta.key"))
+	ta, err := ioutil.ReadFile(path.Join(easyrsaPath, "pki", "ta.key"))
 	if err != nil {
 		return nil, err
 	}
 	auth.TlsAuth = string(ta)
 
-	cert, err := ioutil.ReadFile(path.Join(keysPath, username, username+".crt"))
+	cert, err := ioutil.ReadFile(path.Join(easyrsaPath, "pki", "issued", username+".crt"))
 	if err != nil {
 		return nil, err
 	}
@@ -95,7 +95,7 @@ func GetOpenVPNAuth(username string) (*OpenVPNAuth, error) {
 		return nil, err
 	}
 
-	key, err := ioutil.ReadFile(path.Join(keysPath, username, username+".key"))
+	key, err := ioutil.ReadFile(path.Join(easyrsaPath, "pki", "private", username+".key"))
 	if err != nil {
 		return nil, err
 	}
@@ -105,14 +105,14 @@ func GetOpenVPNAuth(username string) (*OpenVPNAuth, error) {
 }
 
 func main() {
-	flag.StringVar(&keysPath, "keys-path", "/etc/openvpn/client/keys", "keys path")
+	flag.StringVar(&easyrsaPath, "easyrsa-path", "/etc/openvpn/easyrsa", "easyrsa path")
 	flag.StringVar(&confTplPath, "conf-tpl-path", "config.ovpn.tpl", "keys path")
 	flag.StringVar(&authEncKey, "auth-enc-key", "this_is_enc_key", "key for hmac-sha1 in local auth")
 	flag.StringVar(&sanyAuthHost, "sany-auth-host", "", "sany auth service host")
 	flag.Parse()
-	info, err := os.Stat(keysPath)
+	info, err := os.Stat(easyrsaPath)
 	if err != nil || !info.IsDir() {
-		log.Fatal("keys path invalid")
+		log.Fatal("easyrsa path invalid")
 	}
 
 	tpl, err := template.ParseFiles(confTplPath)
@@ -129,6 +129,33 @@ func main() {
 			AuthEncKey: authEncKey,
 		}
 	}
+	http.HandleFunc("/rest/GetUserlogin", func(w http.ResponseWriter, r *http.Request) {
+		username, password, ok := r.BasicAuth()
+		if !ok {
+			log.Printf("[WARN] user %s password incorrect", username)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		log.Printf("[INFO] method:/rest/GetUserlogin username:%s", username)
+
+		token, err := authService.Authorize(context.Background(), username, password)
+		if err != nil || token == "" {
+			log.Printf("[WARN] user %s password incorrect", username)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		ovpnAuth, err := GetOpenVPNAuth(username)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			log.Printf("[ERROR] get ovpn auth error: %s", err)
+			return
+		}
+		err = tpl.Execute(w, ovpnAuth)
+		if err != nil {
+			log.Printf("[ERROR] execute template with error: %s", err)
+		}
+	})
+
 	http.HandleFunc("/RPC2", func(w http.ResponseWriter, r *http.Request) {
 		call := MethodCall{}
 		err := xml.NewDecoder(r.Body).Decode(&call)
@@ -148,9 +175,9 @@ func main() {
 				if err != nil {
 					log.Printf("[WARN] user %s password incorrect", username)
 				} else {
-					p := path.Join(keysPath, username)
-					info, err := os.Stat(p)
-					if err != nil || !info.IsDir() {
+					p := path.Join(easyrsaPath, "pki", "issued", username+".crt")
+					_, err := os.Stat(p)
+					if err != nil {
 						log.Printf("[ERROR] stat key path %s is unavailable", p)
 					} else {
 						status.Value.InnerXML = "<int>0</int>"
