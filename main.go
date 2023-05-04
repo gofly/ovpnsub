@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"encoding/xml"
 	"errors"
@@ -19,13 +20,6 @@ import (
 	"text/template"
 
 	"github.com/gofly/ovpnsub/auth"
-)
-
-var (
-	authEncKey   string
-	easyrsaPath  string
-	confTplPath  string
-	sanyAuthHost string
 )
 
 type MethodCall struct {
@@ -64,6 +58,28 @@ type OpenVPNAuth struct {
 	TlsAuth string
 }
 
+type Config struct {
+	ListenAddr    string `json:"listen_addr"`
+	EasyrsaPath   string `json:"easyrsa_path"`
+	ConfigTplPath string `json:"config_tpl_path"`
+	Auth          struct {
+		Method       string `json:"method"`
+		SanyAuthHost string `json:"sany_auth_host"`
+		LocalAuthKey string `json:"local_auth_key"`
+	} `json:"auth"`
+}
+
+func LoadConfig(confPath string) (*Config, error) {
+	f, err := os.Open(confPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	c := &Config{}
+	err = json.NewDecoder(f).Decode(c)
+	return c, err
+}
+
 func readCert(data []byte) (string, error) {
 	block, _ := pem.Decode(data)
 	if block == nil {
@@ -72,7 +88,7 @@ func readCert(data []byte) (string, error) {
 	return string(pem.EncodeToMemory(block)), nil
 }
 
-func GetOpenVPNAuth(username string) (*OpenVPNAuth, error) {
+func GetOpenVPNAuth(easyrsaPath, username string) (*OpenVPNAuth, error) {
 	auth := &OpenVPNAuth{}
 	ca, err := ioutil.ReadFile(path.Join(easyrsaPath, "pki", "ca.crt"))
 	if err != nil {
@@ -105,28 +121,29 @@ func GetOpenVPNAuth(username string) (*OpenVPNAuth, error) {
 }
 
 func main() {
-	flag.StringVar(&easyrsaPath, "easyrsa-path", "/etc/openvpn/easyrsa", "easyrsa path")
-	flag.StringVar(&confTplPath, "conf-tpl-path", "config.ovpn.tpl", "keys path")
-	flag.StringVar(&authEncKey, "auth-enc-key", "this_is_enc_key", "key for hmac-sha1 in local auth")
-	flag.StringVar(&sanyAuthHost, "sany-auth-host", "", "sany auth service host")
+	confPath := flag.String("config", "/usr/local/ovpnsub/config/ovpnsub.json", "config file path")
 	flag.Parse()
-	info, err := os.Stat(easyrsaPath)
+	config, err := LoadConfig(*confPath)
+	if err != nil {
+		log.Fatalf("[FATAL] load config %s with fatal: %s", *confPath, err)
+	}
+	info, err := os.Stat(config.EasyrsaPath)
 	if err != nil || !info.IsDir() {
 		log.Fatal("easyrsa path invalid")
 	}
 
-	tpl, err := template.ParseFiles(confTplPath)
+	tpl, err := template.ParseFiles(config.ConfigTplPath)
 	if err != nil {
 		log.Fatalf("parse config template with error: %s", err)
 	}
 	var authService auth.AuthService
-	if sanyAuthHost != "" {
+	if config.Auth.Method == "sany" {
 		authService = &auth.SanyAuthService{
-			Host: sanyAuthHost,
+			Host: config.Auth.SanyAuthHost,
 		}
 	} else {
 		authService = &auth.LocalAuthService{
-			AuthEncKey: authEncKey,
+			AuthEncKey: config.Auth.LocalAuthKey,
 		}
 	}
 	// for windows client
@@ -145,7 +162,7 @@ func main() {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
-		ovpnAuth, err := GetOpenVPNAuth(username)
+		ovpnAuth, err := GetOpenVPNAuth(config.EasyrsaPath, username)
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			log.Printf("[ERROR] get ovpn auth error: %s", err)
@@ -177,7 +194,7 @@ func main() {
 				if err != nil {
 					log.Printf("[WARN] user %s password incorrect", username)
 				} else {
-					p := path.Join(easyrsaPath, "pki", "issued", username+".crt")
+					p := path.Join(config.EasyrsaPath, "pki", "issued", username+".crt")
 					_, err := os.Stat(p)
 					if err != nil {
 						log.Printf("[ERROR] stat key path %s is unavailable", p)
@@ -216,7 +233,7 @@ func main() {
 				w.WriteHeader(http.StatusUnauthorized)
 				return
 			}
-			ovpnAuth, err := GetOpenVPNAuth(username)
+			ovpnAuth, err := GetOpenVPNAuth(config.EasyrsaPath, username)
 			if err != nil {
 				w.WriteHeader(http.StatusInternalServerError)
 				log.Printf("[ERROR] get ovpn auth error: %s", err)
@@ -248,5 +265,5 @@ func main() {
 			io.Copy(w, buf)
 		}
 	})
-	http.ListenAndServe(":1380", nil)
+	http.ListenAndServe(config.ListenAddr, nil)
 }
