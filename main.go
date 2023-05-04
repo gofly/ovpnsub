@@ -80,7 +80,7 @@ func GetOpenVPNAuth(username string) (*OpenVPNAuth, error) {
 	}
 	auth.CACert = string(ca)
 
-	ta, err := ioutil.ReadFile(path.Join(easyrsaPath, "pki", "ta.key"))
+	ta, err := ioutil.ReadFile(path.Join(easyrsaPath, "ta.key"))
 	if err != nil {
 		return nil, err
 	}
@@ -129,6 +129,7 @@ func main() {
 			AuthEncKey: authEncKey,
 		}
 	}
+	// for windows client
 	http.HandleFunc("/rest/GetUserlogin", func(w http.ResponseWriter, r *http.Request) {
 		username, password, ok := r.BasicAuth()
 		if !ok {
@@ -156,6 +157,7 @@ func main() {
 		}
 	})
 
+	// for android client
 	http.HandleFunc("/RPC2", func(w http.ResponseWriter, r *http.Request) {
 		call := MethodCall{}
 		err := xml.NewDecoder(r.Body).Decode(&call)
